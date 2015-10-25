@@ -1,0 +1,209 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Ed Rogers"
+date: "October 21, 2015"
+output: html_document
+---
+
+# Executive Summary
+
+Various models are fit on the Human Activity Recognition training dataset provided. After comparison, a Random Forest model is selected, tuned, and trained on the dataset in order to predict the missing `classe` variable in the test dataset provided. 
+
+# Exploratory Data Analysis
+
+Data are loaded from downloaded files, and a brief exploratory analysis shows a majority of the rows in the original training data can be dropped.
+
+```{r EDA, warning=FALSE, message=FALSE, cache=TRUE}
+library(GGally)
+library(caret)
+library(nnet)
+library(doParallel)
+library(dplyr)
+
+registerDoParallel(cores = 4)
+
+set.seed(1234)
+setwd("~/R/MachineLearning/CourseProject/")
+
+train <- read.csv("pml-training.csv")
+test  <- read.csv("pml-testing.csv")
+
+#Many rows of the Test dataset are not useful, as they have all NA values.
+sum(colSums(is.na(test)) == nrow(test))
+
+#These rows can be dropped safely from both the Test and Train datasets.
+test <- test[,colSums(is.na(test)) != nrow(test)]
+usefulColumns <- colnames(test)
+usefulColumns <- c(usefulColumns,"classe")
+train <- train[,which(colnames(train) %in% usefulColumns)]
+
+#The variable "X" has a perfect correlation with the "classe" value in the training dataset. This could mislead our model, so we will exclude it from training.
+ggplot(train, aes(X)) + 
+  geom_freqpoly(aes(group = classe, colour = classe),binwidth=50) +
+  ggtitle("X as a Misleading Predictor")
+
+train <- train[,-grep("^X$",colnames(train))]
+test  <- test[,-grep("^X$",colnames(test))]
+
+#Also removing "timestamp" and "window" vars
+train <- train[,-grep("timestamp",colnames(train))]
+test  <- test[,-grep("timestamp",colnames(test))]
+train <- train[,-grep("window",colnames(train))]
+test  <- test[,-grep("window",colnames(test))]
+
+#Some data should be reserved for out-of-sample error estimation
+inTrain <- createDataPartition(y=train$classe,p=0.75,list=FALSE)
+fullTrainingData     <- train
+trainErrorEstimation <- train[-inTrain,]
+train                <- train[inTrain,]
+
+#Some EDA on variable subsets:
+ggpairs(data=train,
+        columns = c(grep("classe",colnames(train)),51:53),
+        color="classe",
+        title="A Pair-Wise Display of a Small Subset of the Final 53 Predictors",
+        params=c(alpha=6/10,size=6/10))
+```
+
+**Figure 2:**  After an exploratory data analysis, 53 of the predictor variables and 1 response variable are retained for our model creation. Looking at a small subset of these predictors, we can see they have complicated relationships that may lend themselves to a machine learning approach.
+
+# Model Comparison
+
+Multiple models will be trained and tuned on the `train` data.frame. The `trainErrorEstimation` data.frame will be held in reserve for a final, out-of-sample error estimate after a final model is selected.
+
+## RPart
+
+```{r ModelSelectionRPart, warning=FALSE, message=FALSE, cache=TRUE}
+confusionMatrixError <- function(CM) { 
+  (sum(CM[1:5,1:5])-sum(diag(CM)))/sum(CM[1:5,1:5])
+}
+
+minimumErrors <- data.frame()
+
+modFitRPart <- train(classe ~ ., data=train, method="rpart")
+CMRPart <- confusionMatrix(train$classe,predict(modFitRPart,train))$table
+#OOB estimate of  error rate:
+minimumErrors <- rbind(minimumErrors,rpart=c(confusionMatrixError(CMRPart)))
+colnames(minimumErrors) <- "minErr"
+```
+
+## Linear Discriminant Analysis
+
+```{r ModelSelectionLDA, warning=FALSE, message=FALSE, cache=TRUE}
+modFitLDA <- train(classe ~ ., data=train, method="lda")
+CMLDA <- confusionMatrix(train$classe,predict(modFitLDA,train))$table
+#OOB estimate of  error rate:
+minimumErrors <- rbind(minimumErrors,lda=c(confusionMatrixError(CMLDA)))
+```
+
+## Naive Bayes
+
+```{r ModelSelectionNaiveBayes, warning=FALSE, message=FALSE, cache=TRUE}
+modFitNB <- train(classe ~ ., data=train, method="nb")
+CMNB <- confusionMatrix(train$classe,predict(modFitNB,train))$table
+#OOB estimate of  error rate:
+minimumErrors <- rbind(minimumErrors,nb=c(confusionMatrixError(CMNB)))
+```
+
+## Multinomial
+
+```{r ModelSelectionMultinomial, warning=FALSE, message=FALSE, cache=TRUE}
+modFitMN <- multinom(classe ~ ., data=train,maxit=1000)
+CMMN <- confusionMatrix(train$classe,predict(modFitMN,train))$table
+#OOB estimate of  error rate:
+minimumErrors <- rbind(minimumErrors,mn=c(confusionMatrixError(CMMN)))
+```
+
+## Random Forest
+
+```{r ModelSelectionRF, warning=FALSE, message=FALSE, cache=TRUE}
+modFitRF   <- train(classe ~ ., data=train, method="rf")
+#modFitRF   <- randomForest(classe ~ ., data=train)
+CMRF <- confusionMatrix(modFitRF)$table
+#OOB estimate of  error rate:
+minimumErrors <- rbind(minimumErrors,rf=c(confusionMatrixError(CMRF)))
+```
+
+# Final Model Selection: 
+
+First, we can roughly compare the models by considering their Minimum Error Rate, as computed using each model on the original `train` dataset to create a Confusion Matrix. This value should underestimate the error due to over-fitting, but is nevertheless a worthwhile comparison between different models.
+
+```{r modelErrors, warning=FALSE, message=FALSE, cache=TRUE}
+minimumErrors <- minimumErrors[order(minimumErrors$minErr),,drop=FALSE]
+minimumErrors
+minimumErrors <- minimumErrors[1,,drop=FALSE]
+```
+
+It is evident that Random Forests is the superior modeling technique for this problem.
+
+From this point forward, we switch to using the `randomForests` library, as it is much more efficient for performing these computations.
+
+## Tuning Random Forests
+
+### Tuning the mtry Parameter
+
+By tuning the mtry parameter, modest gains can be made in reducing the minimum error rate. We've started with an mtry of `r modFitRF$finalModel$mtry`, which we will tune for lowest Out-Of-Bag Error, and retrain.
+
+```{r ModelSelectionTuned, warning=FALSE, message=FALSE, cache=TRUE}
+library(randomForest)
+modFitTuned <- tuneRF(train[,-54],train[,54],
+                      mtryStart = modFitRF$finalModel$mtry, 
+                      stepFactor=1.5,
+                      improve = 0.001,
+                      plot=TRUE,
+                      doBest = TRUE)
+```
+
+**Figure 3:** After tuning, the best `mtry` value, `r modFitTuned$mtry`, was selected for the final model for its low Out-Of-Bag Error.
+
+```{r appendTunedModelToErrors,warning=FALSE,message=FALSE,cache=TRUE}
+#OOB estimate of  error rate:
+minimumErrors <- rbind(minimumErrors,rfTuned=c(confusionMatrixError(modFitTuned$confusion)))
+```
+
+# Computing the Out-Of-Sample Error for the Final Model
+
+The model can now be applied to the reserved data to estimate its out-of-sample error.
+
+```{r outOfSampleError, warning=FALSE, message=FALSE, cache=TRUE}
+oosPredict <- predict(modFitTuned,trainErrorEstimation)
+CMOutOfSample <- confusionMatrix(trainErrorEstimation$classe,oosPredict)$table
+#OOB estimate of  error rate:
+minimumErrors <- rbind(minimumErrors,OutOfSample=c(confusionMatrixError(CMOutOfSample)))
+minimumErrors
+
+OutOfSampleError <- paste(round(100*confusionMatrixError(CMOutOfSample),digits = 2),"%",sep="")
+OutOfSampleError
+```
+
+## The Out-Of-Sample Error using Cross-Validation is `r OutOfSampleError`
+
+Using cross-validation, the most accurate prediction of Out-Of-Sample error rate using this particular tuning of Random Forests is `r OutOfSampleError`. We will now retrain one last time, using all of the training data to prepare for our test sample.
+
+```{r finalTraining, warning=FALSE, message=FALSE, cache=TRUE}
+modFitFinal <- randomForest(classe ~ ., data=fullTrainingData,
+                            mtry=modFitTuned$mtry)
+```
+
+# Predicting the Test Set
+
+Using the fully-tuned, fully-trained model, the test set can be predicted.
+
+```{r testSet, warning=FALSE, message=FALSE, cache=TRUE}
+testPredictions <- predict(modFitFinal,test)
+testPredictions
+```
+
+Last, the submissions files are generated using the code provided by the Coursera instructions.
+
+```{r pml_write_files, warning=FALSE, message=FALSE}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+pml_write_files(testPredictions)
+```
